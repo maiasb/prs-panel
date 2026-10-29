@@ -22,9 +22,11 @@ CAMPOS = "repository,title,url,number,createdAt,updatedAt,isDraft,labels,comment
 ACOES = {  # rota -> comando do gh
     "/api/aprovar": ("pr", "review", "--approve"),
     "/api/fechar": ("pr", "close"),
+    "/api/mergear": ("pr", "merge", "--merge"),
 }
 REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 LIMITE_DIFF = 400_000
+CAMPOS_FECHADOS = "repository,title,url,number,closedAt,updatedAt,state,author"
 
 PAGINA = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
@@ -51,6 +53,10 @@ a{color:inherit;text-decoration:none}
 .topo{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;padding:36px 0 20px}
 .topo h1{margin:0;font-size:26px;font-weight:650;letter-spacing:-.02em}
 .topo p{margin:2px 0 0;color:var(--mudo);font-size:13px}
+.topo-acoes{display:flex;gap:8px;align-items:center}
+.abas{display:flex;gap:4px;padding:3px;background:var(--superficie);border:1px solid var(--linha);border-radius:10px}
+.abas button{border-color:transparent;background:transparent;color:var(--mudo)}
+.abas button[aria-pressed=true]{background:var(--elevado);color:var(--txt)}
 
 /* botões */
 button{font:inherit;font-size:13px;font-weight:500;color:var(--txt);background:var(--elevado);
@@ -105,10 +111,15 @@ button.perigo.sim{background:var(--erro);color:#2b0807;border-color:var(--erro)}
 .titulo-pr{display:flex;gap:10px;align-items:baseline;font-weight:550}
 .titulo-pr a{overflow-wrap:anywhere}.titulo-pr a:hover{color:var(--acento)}
 .ponto{flex:none;width:8px;height:8px;border-radius:50%;background:var(--ok);transform:translateY(-1px)}
+.ponto.mesclado{background:var(--acento)}.ponto.fechado{background:var(--rascunho)}
 .ponto.rascunho{background:var(--rascunho)}.ponto.conflito{background:var(--erro)}
 .meta{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;margin-top:3px;color:var(--mudo);font-size:12.5px}
 .tag{border-radius:6px;padding:0 7px;font-size:11.5px;font-weight:550;background:var(--elevado);color:var(--mudo)}
 .tag.conflito{background:rgba(255,107,107,.12);color:var(--erro)}
+.tag.falhou{background:rgba(255,107,107,.12);color:var(--erro)}
+.tag.andando{background:var(--acento-bg);color:var(--acento)}
+.tag.ok{background:rgba(74,194,138,.12);color:var(--ok)}
+.tag.mesclado{background:rgba(154,165,255,.14);color:var(--acento)}
 .tag.parado{background:rgba(226,176,74,.12);color:var(--aviso)}
 .acoes{display:flex;gap:6px;align-items:center}
 .msg{font-size:12px;color:var(--mudo)}.msg.erro{color:var(--erro);max-width:260px}
@@ -146,7 +157,12 @@ button.perigo.sim{background:var(--erro);color:#2b0807;border-color:var(--erro)}
 <div class="pagina">
   <header class="topo">
     <div><h1>Pull requests</h1><p id="resumo">Carregando…</p></div>
-    <button id="atualizar">Atualizar</button>
+    <div class="topo-acoes">
+      <nav class="abas" aria-label="Seção">
+        <button data-aba="abertos">Abertos</button><button data-aba="fechados">Fechados</button>
+      </nav>
+      <button id="atualizar">Atualizar</button>
+    </div>
   </header>
   <div class="barra">
     <input id="busca" type="search" placeholder="Buscar por título, repositório ou autor" aria-label="Buscar PRs">
@@ -169,8 +185,10 @@ const dias = iso => Math.floor((Date.now() - new Date(iso)) / 864e5);
 const idade = d => d < 1 ? ["hoje", ""] : d < 30 ? [d, "dias"] : d < 365 ? [Math.floor(d / 30), "meses"] : [Math.floor(d / 365), "anos"];
 const PARADO = 30;
 
-let dados = { meus: [], revisao: [] };
-const filtro = { escopo: "todos", conflito: false, parado: false, busca: "" };
+let dados = { meus: [], revisao: [] }, fechados = [];
+let aba = location.hash === "#fechados" ? "fechados" : "abertos";
+const ocultos = new Map();  // url do PR -> até quando fica fora da lista (a busca do GitHub demora a refletir a ação)
+const filtro = { escopo: "todos", conflito: false, parado: false, busca: "", estado: "todos" };
 
 async function api(url, corpo) {
   const r = await fetch(url, corpo ? { method: "POST", headers: { "X-Painel-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(corpo) } : {});
@@ -182,6 +200,7 @@ async function api(url, corpo) {
 // Botão de duas etapas: o primeiro clique pede confirmação, o segundo executa.
 const ACOES = {
   aprovar: { rotulo: "Aprovar", confirma: "Confirmar aprovação", andando: "Aprovando…", feito: "Aprovado ✓", rota: "/api/aprovar", cls: "ok" },
+  mergear: { rotulo: "Mergear", confirma: "Confirmar merge", andando: "Mergeando…", feito: "Mergeado ✓", rota: "/api/mergear", cls: "ok" },
   fechar: { rotulo: "Fechar PR", confirma: "Confirmar fechamento", andando: "Fechando…", feito: "Fechado ✓", rota: "/api/fechar", cls: "perigo" },
 };
 function botaoAcao(tipo, p, msg, aoConcluir) {
@@ -205,6 +224,36 @@ function botaoAcao(tipo, p, msg, aoConcluir) {
   return b;
 }
 
+// Mergear só habilita com todos os checks verdes; o servidor confere de novo.
+function botaoMergear(p, msg, aoConcluir) {
+  const b = botaoAcao("mergear", p, msg, aoConcluir), c = p.checks;
+  if (!c || c.andando.length || c.falhou.length) {
+    b.disabled = true;
+    b.title = !c ? "Não foi possível ler os checks do PR"
+      : c.falhou.length ? "Checks falhando: " + c.falhou.join(", ")
+      : "Aguardando pipelines: " + c.andando.join(", ");
+  }
+  return b;
+}
+
+// Tira o PR da lista na hora e reconcilia com o GitHub logo depois.
+function atualizarApos(p) {
+  ocultos.set(p.url, Date.now() + 60000);
+  render();
+  setTimeout(carregar, 2000);
+}
+
+function tagChecks(c) {
+  if (!c) return null;
+  const n = c.falhou.length ? [c.falhou, "falhou", c.falhou.length > 1 ? "checks falharam" : "check falhou"]
+    : c.andando.length ? [c.andando, "andando", c.andando.length > 1 ? "pipelines em execução" : "pipeline em execução"]
+    : c.ok.length ? [c.ok, "ok", "checks ok"] : null;
+  if (!n) return null;
+  const t = el("span", "tag " + n[1], (n[1] === "ok" ? "" : n[0].length + " ") + n[2]);
+  t.title = n[0].join("\\n");
+  return t;
+}
+
 function linhaDiff(l) {
   const d = el("div", null, l || " ");
   if (l.startsWith("diff --git")) d.className = "arq";
@@ -215,11 +264,15 @@ function linhaDiff(l) {
   return d;
 }
 
-async function abrirDiff(p, podeAprovar) {
+async function abrirDiff(p, podeAprovar, leitura) {
   $("m-titulo").textContent = `${p.repository.nameWithOwner} #${p.number} · ${p.title}`;
   $("m-msg").textContent = ""; $("m-stat").replaceChildren(); $("m-acao").replaceChildren();
-  if (podeAprovar) $("m-acao").append(botaoAcao("aprovar", p, $("m-msg"), carregar));
-  $("m-acao").append(botaoAcao("fechar", p, $("m-msg"), () => { fecharDiff(); setTimeout(carregar, 1500); }));
+  const aoConcluir = () => { fecharDiff(); atualizarApos(p); };
+  if (!leitura) {
+    if (podeAprovar) $("m-acao").append(botaoAcao("aprovar", p, $("m-msg"), () => atualizarApos(p)));
+    else if (podeMergear(p)) $("m-acao").append(botaoMergear(p, $("m-msg"), aoConcluir));
+    $("m-acao").append(botaoAcao("fechar", p, $("m-msg"), aoConcluir));
+  }
   $("diff").replaceChildren(el("div", "msg", "Carregando diff…"));
   $("modal").classList.add("aberto");
   try {
@@ -241,6 +294,9 @@ const fecharDiff = () => $("modal").classList.remove("aberto");
 $("m-fechar").onclick = fecharDiff;
 document.addEventListener("keydown", e => { if (e.key === "Escape") fecharDiff(); });
 
+// Só os meus PRs, prontos e sem conflito; checks e revisões obrigatórias o GitHub valida no merge.
+const podeMergear = p => !p.isDraft && p.mergeable !== "CONFLICTING";
+
 function linhaPR(p, podeAprovar) {
   const conflito = p.mergeable === "CONFLICTING", velho = dias(p.updatedAt) > PARADO;
   const box = el("div", "pr");
@@ -258,6 +314,7 @@ function linhaPR(p, podeAprovar) {
   if (podeAprovar && p.author) meta.append(el("span", null, "de " + p.author.login));
   if (conflito) { const c = el("span", "tag conflito", "Conflito na branch"); c.title = "A branch tem conflitos com a base e não pode ser mesclada até resolver"; meta.append(c); }
   if (p.isDraft) meta.append(el("span", "tag", "Rascunho"));
+  const tc = tagChecks(p.checks); if (tc) meta.append(tc);
   if (velho) meta.append(el("span", "tag parado", "Parado"));
   for (const l of p.labels) meta.append(el("span", "tag", l.name));
   const [v2, u2] = idade(dias(p.createdAt));
@@ -266,10 +323,11 @@ function linhaPR(p, podeAprovar) {
   corpo.append(t, meta);
 
   const acoes = el("div", "acoes"), msg = el("span", "msg");
-  const depois = () => setTimeout(carregar, 1500);
+  const depois = () => atualizarApos(p);
   const bd = el("button", "suave", "Ver diff"); bd.onclick = () => abrirDiff(p, podeAprovar);
   acoes.append(bd);
   if (podeAprovar) acoes.append(botaoAcao("aprovar", p, msg, depois));
+  else if (podeMergear(p)) acoes.append(botaoMergear(p, msg, depois));
   acoes.append(botaoAcao("fechar", p, msg, depois), msg);
 
   box.append(id, corpo, acoes);
@@ -313,6 +371,13 @@ function desenharChips() {
 }
 
 function render() {
+  document.querySelectorAll("[data-aba]").forEach(b => b.setAttribute("aria-pressed", b.dataset.aba === aba));
+  aba === "fechados" ? renderFechados() : renderAbertos();
+}
+
+function renderAbertos() {
+  const vivo = l => l.filter(p => !(ocultos.get(p.url) > Date.now()));
+  dados = { meus: vivo(dados.meus), revisao: vivo(dados.revisao) };
   desenharChips();
   const q = filtro.busca.toLowerCase();
   const passa = p => (!filtro.conflito || p.mergeable === "CONFLICTING") && (!filtro.parado || dias(p.updatedAt) > PARADO)
@@ -327,20 +392,72 @@ function render() {
       filtrando ? "Nenhum PR com esses filtros." : "Você não tem PRs abertos."));
 }
 
+function linhaFechado(p) {
+  const mesclado = p.state === "merged", box = el("div", "pr");
+  const [valor, unidade] = idade(dias(p.closedAt));
+  const id = el("div", "idade");
+  id.append(el("b", null, valor), el("small", null, unidade || (mesclado ? "mesclado" : "fechado")));
+  id.title = "Tempo desde que o PR foi " + (mesclado ? "mesclado" : "fechado");
+  const corpo = el("div", "corpo"), t = el("div", "titulo-pr");
+  const a = el("a", null, p.title); a.href = p.url; a.target = "_blank"; a.rel = "noopener";
+  t.append(el("span", "ponto " + (mesclado ? "mesclado" : "fechado")), a);
+  const meta = el("div", "meta");
+  meta.append(el("span", null, "#" + p.number), el("span", "tag" + (mesclado ? " mesclado" : ""), mesclado ? "Mesclado" : "Fechado sem merge"));
+  corpo.append(t, meta);
+  const acoes = el("div", "acoes"), bd = el("button", "suave", "Ver diff");
+  bd.onclick = () => abrirDiff(p, false, true);
+  acoes.append(bd);
+  box.append(id, corpo, acoes);
+  return box;
+}
+
+function renderFechados() {
+  const n = e => fechados.filter(p => p.state === e).length;
+  const itens = [["Todos", "todos", fechados.length], ["Mesclados", "merged", n("merged")], ["Fechados sem merge", "closed", n("closed")]];
+  $("chips").replaceChildren(...itens.map(([rot, est, qtd]) => {
+    const b = el("button", "chip"); b.setAttribute("aria-pressed", filtro.estado === est);
+    b.append(rot, el("b", null, qtd));
+    b.onclick = () => { filtro.estado = est; render(); };
+    return b;
+  }));
+  const q = filtro.busca.toLowerCase();
+  const lista = fechados.filter(p => (filtro.estado === "todos" || p.state === filtro.estado)
+    && (!q || `${p.title} ${p.repository.nameWithOwner}`.toLowerCase().includes(q)))
+    .sort((a, b) => b.closedAt.localeCompare(a.closedAt));
+  const sec = el("section", "bloco"), h = el("h2", "bloco-titulo", "Seus PRs fechados"), box = el("div", "lista");
+  h.append(el("span", "n", lista.length));
+  if (!lista.length) box.append(el("div", "vazio", q || filtro.estado !== "todos" ? "Nenhum PR com esses filtros." : "Nenhum PR fechado."));
+  for (const p of lista) box.append(linhaFechado(p));
+  sec.append(h, box);
+  $("conteudo").replaceChildren(sec);
+}
+
+let proximo;  // atualização automática: 20 s enquanto houver pipeline em execução, senão 5 min
+function agendar() {
+  clearTimeout(proximo);
+  const rodando = aba === "abertos" && [...dados.meus, ...dados.revisao].some(p => p.checks?.andando.length);
+  proximo = setTimeout(() => $("modal").classList.contains("aberto") ? agendar() : carregar(), rodando ? 20000 : 300000);
+}
+
 async function carregar() {
   $("resumo").textContent = "Atualizando…";
   try {
-    dados = await api("/api/prs");
+    if (aba === "fechados") fechados = (await api("/api/fechados")).fechados;
+    else dados = await api("/api/prs");
     render();
-    $("resumo").textContent = `Atualizado às ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}. Recarrega a cada 5 minutos.`;
+    $("resumo").textContent = `Atualizado às ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}. Recarrega sozinho.`;
   } catch (e) {
     $("conteudo").replaceChildren(el("div", "erro-geral", "Não foi possível consultar o GitHub.\\n" + e.message + "\\nConfira se o gh está logado: gh auth status"));
     $("resumo").textContent = "Falha ao atualizar";
   }
+  agendar();
 }
 $("atualizar").onclick = carregar;
 $("busca").oninput = e => { filtro.busca = e.target.value.trim(); render(); };
-setInterval(() => { if (!$("modal").classList.contains("aberto")) carregar(); }, 5 * 60 * 1000);
+document.querySelectorAll("[data-aba]").forEach(b => b.onclick = () => {
+  aba = b.dataset.aba; location.hash = aba === "fechados" ? "fechados" : "";
+  $("conteudo").replaceChildren(); carregar();
+});
 carregar();
 </script></body></html>""".replace("__TOKEN__", TOKEN)
 
@@ -355,15 +472,47 @@ def buscar(filtro):
         raise RuntimeError(r.stderr.strip() or "falha no gh")
     prs = json.loads(r.stdout)
     with ThreadPoolExecutor(8) as ex:  # a busca não traz o estado de merge; um `pr view` por PR
-        for pr, estado in zip(prs, ex.map(estado_merge, prs)):
-            pr["mergeable"] = estado
+        for pr, (mergeable, checks) in zip(prs, ex.map(estado_merge, prs)):
+            pr["mergeable"], pr["checks"] = mergeable, checks
     return prs
 
 
+def resumir_checks(rollup):
+    """Separa os checks do PR em ok, andando (pipeline em execução ou na fila) e falhou."""
+    grupos = {"ok": [], "andando": [], "falhou": []}
+    for c in rollup or []:
+        if c.get("__typename") == "StatusContext":
+            nome, estado = c.get("context"), c.get("state")
+            g = "ok" if estado == "SUCCESS" else "andando" if estado in ("PENDING", "EXPECTED") else "falhou"
+        else:
+            nome = c.get("name")
+            if c.get("status") != "COMPLETED":
+                g = "andando"
+            else:
+                g = "ok" if c.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED") else "falhou"
+        grupos[g].append(nome or "?")
+    return grupos
+
+
+def estado_pr(repo, n):
+    """(mergeable, checks) do PR; checks é None se a consulta falhar."""
+    r = gh("pr", "view", str(n), "--repo", repo, "--json", "mergeable,statusCheckRollup")
+    if r.returncode:
+        return "UNKNOWN", None
+    d = json.loads(r.stdout)
+    return d["mergeable"], resumir_checks(d["statusCheckRollup"])
+
+
 def estado_merge(pr):
-    r = gh("pr", "view", str(pr["number"]), "--repo", pr["repository"]["nameWithOwner"],
-           "--json", "mergeable", "--jq", ".mergeable")
-    return r.stdout.strip() if r.returncode == 0 else "UNKNOWN"
+    return estado_pr(pr["repository"]["nameWithOwner"], pr["number"])
+
+
+def buscar_fechados():
+    r = gh("search", "prs", "--author", "@me", "--state", "closed", "--sort", "updated",
+           "--limit", "100", "--json", CAMPOS_FECHADOS)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip() or "falha no gh")
+    return json.loads(r.stdout)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -401,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(dados)
             elif url.path == "/api/prs":
                 self._json(200, {"meus": buscar("--author"), "revisao": buscar("--review-requested")})
+            elif url.path == "/api/fechados":
+                self._json(200, {"fechados": buscar_fechados()})
             elif url.path == "/api/diff":
                 q = parse_qs(url.query)
                 repo, n = q.get("repo", [""])[0], q.get("n", [""])[0]
@@ -427,6 +578,13 @@ class Handler(BaseHTTPRequestHandler):
             repo, n = corpo.get("repo"), corpo.get("n")
             if not self._pr_valido(repo, n):
                 return
+            if self.path == "/api/mergear":  # a trava do botão não basta: confere os checks de novo no servidor
+                _, checks = estado_pr(repo, n)
+                if checks is None:
+                    return self._json(502, {"erro": "não foi possível ler os checks do PR"})
+                if checks["falhou"] or checks["andando"]:
+                    pend = checks["falhou"] + checks["andando"]
+                    return self._json(409, {"erro": "checks sem sucesso: " + ", ".join(pend)})
             cmd = ACOES[self.path]
             r = gh(*cmd[:2], str(n), "--repo", repo, *cmd[2:])
             if r.returncode:

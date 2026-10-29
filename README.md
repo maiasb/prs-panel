@@ -45,13 +45,15 @@ Sem o `prs.sh`, dá para rodar direto: `python3 painel.py [porta]`.
 - **Para revisar**: PRs em que pediram a sua revisão como pessoa (`--review-requested @me`). Pedidos feitos a um time seu não aparecem.
 - **Meus**: PRs abertos por você.
 - Filtros: **Todos**, **Para revisar**, **Meus**, **Com conflito** e **Parados** (sem atualização há mais de 30 dias), além da busca por título, repositório ou autor.
+- Cada PR mostra o estado dos checks (pipelines em execução, falhando ou ok). Enquanto houver pipeline em execução, a lista atualiza sozinha a cada 20 s; sem pipeline, a cada 5 min. Depois de aprovar, mergear ou fechar, o PR sai da lista na hora e a lista é recarregada em seguida.
+- Aba **Fechados**: seus PRs fechados (até 100, mais recentes primeiro), com filtro Mesclados / Fechados sem merge e busca. Link direto: `#fechados`.
 - **Ver diff** abre o diff do PR no painel.
-- **Aprovar** (nos PRs para revisar) e **Fechar** executam `gh pr review --approve` e `gh pr close`.
+- **Aprovar** (nos PRs para revisar), **Mergear** (nos seus PRs, exceto rascunhos e com conflito; fica desabilitado enquanto houver pipeline em execução ou check falhando, e o servidor confere de novo antes de mesclar) e **Fechar** executam `gh pr review --approve`, `gh pr merge --merge` e `gh pr close`. Cada um pede um segundo clique de confirmação. Se o repositório bloquear o merge (checks pendentes, revisão obrigatória, método não permitido), o erro do GitHub aparece ao lado do botão.
 
 ## Segurança
 
 - O servidor escuta só em `127.0.0.1` e rejeita requisições com `Host` diferente (proteção contra DNS rebinding).
-- As ações (aprovar, fechar) exigem um token gerado a cada execução, para que outras páginas abertas no navegador não consigam disparar POSTs.
+- As ações (aprovar, mergear, fechar) exigem um token gerado a cada execução, para que outras páginas abertas no navegador não consigam disparar POSTs.
 - O projeto não contém segredos. Se um dia precisar de algum, use variáveis de ambiente lidas com `os.environ` e um `.env` (já ignorado pelo `.gitignore`).
 
 ## Problemas comuns
