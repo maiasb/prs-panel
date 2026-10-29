@@ -46,10 +46,18 @@ Sem o `prs.sh`, dá para rodar direto: `python3 painel.py [porta]`.
 - **Meus**: PRs abertos por você.
 - Filtros: **Todos**, **Para revisar**, **Meus**, **Com conflito** e **Parados** (sem atualização há mais de 30 dias), além da busca por título, repositório ou autor.
 - Cada PR mostra o estado dos checks (pipelines em execução, falhando ou ok). Enquanto houver pipeline em execução, a lista atualiza sozinha a cada 20 s; sem pipeline, a cada 5 min. Depois de aprovar, mergear ou fechar, o PR sai da lista na hora e a lista é recarregada em seguida.
-- **Branches sem PR** (abaixo dos seus PRs abertos): branches que você enviou nos últimos 7 dias, que estão à frente da branch padrão, ainda existem e nunca tiveram PR. O botão **Abrir PR** leva à tela de comparação do GitHub. A lista vem dos eventos de push da sua conta (a API do GitHub guarda poucos eventos recentes), então pushes muito antigos ou em volume alto podem não aparecer.
+- **Branches sem PR** (abaixo dos seus PRs abertos): branches que você enviou nos últimos 7 dias, que estão à frente da branch padrão, ainda existem e nunca tiveram PR. O botão **Abrir PR** leva à tela de comparação do GitHub. Veja as limitações abaixo.
 - Aba **Fechados**: seus PRs fechados (até 100, mais recentes primeiro), com filtro Mesclados / Fechados sem merge e busca. Link direto: `#fechados`.
 - **Ver diff** abre o diff do PR no painel.
 - **Aprovar** (nos PRs para revisar), **Mergear** (nos seus PRs, exceto rascunhos e com conflito; fica desabilitado enquanto houver pipeline em execução ou check falhando, e o servidor confere de novo antes de mesclar) e **Fechar** executam `gh pr review --approve`, `gh pr merge --merge` e `gh pr close`. Cada um pede um segundo clique de confirmação. Se o repositório bloquear o merge (checks pendentes, revisão obrigatória, método não permitido), o erro do GitHub aparece ao lado do botão.
+
+## Limitações conhecidas
+
+**Branches sem PR**
+
+- A lista vem dos eventos de push da sua conta, e a API do GitHub guarda poucos eventos recentes. Com muitos pushes, ou pushes antigos, algumas branches podem não aparecer.
+- O critério é do painel, não o do aviso "Compare & pull request" do GitHub, então a lista pode divergir do banner. A janela de 7 dias é a constante `JANELA_PUSH_DIAS` em `painel.py`.
+- Depois que você abre o PR de uma branch, ela só sai da lista na próxima atualização automática (20 s a 5 min).
 
 ## Segurança
 
