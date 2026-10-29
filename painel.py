@@ -12,8 +12,10 @@ import sys
 import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 TOKEN = secrets.token_urlsafe(24)  # barra POST vindo de outras páginas abertas no navegador
@@ -26,6 +28,7 @@ ACOES = {  # rota -> comando do gh
 }
 REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 LIMITE_DIFF = 400_000
+JANELA_PUSH_DIAS = 7  # só branches enviadas nesse período entram em "sem PR"
 CAMPOS_FECHADOS = "repository,title,url,number,closedAt,updatedAt,state,author"
 
 PAGINA = """<!doctype html>
@@ -186,6 +189,7 @@ const idade = d => d < 1 ? ["hoje", ""] : d < 30 ? [d, "dias"] : d < 365 ? [Math
 const PARADO = 30;
 
 let dados = { meus: [], revisao: [] }, fechados = [];
+let semPr = [];  // branches enviadas sem PR; null se a consulta falhou
 let aba = location.hash === "#fechados" ? "fechados" : "abertos";
 const ocultos = new Map();  // url do PR -> até quando fica fora da lista (a busca do GitHub demora a refletir a ação)
 const filtro = { escopo: "todos", conflito: false, parado: false, busca: "", estado: "todos" };
@@ -390,6 +394,35 @@ function renderAbertos() {
   if (filtro.escopo !== "revisao")
     alvo.append(bloco("Seus PRs abertos", dados.meus.filter(passa), false,
       filtrando ? "Nenhum PR com esses filtros." : "Você não tem PRs abertos."));
+  if (filtro.escopo !== "revisao") alvo.append(blocoSemPr());
+}
+
+function blocoSemPr() {
+  const sec = el("section", "bloco"), h = el("h2", "bloco-titulo", "Branches sem PR");
+  const lista = el("div", "lista");
+  h.append(el("span", "n", semPr ? semPr.length : "?"));
+  const q = filtro.busca.toLowerCase();
+  const itens = (semPr || []).filter(b => !q || `${b.branch} ${b.repo}`.toLowerCase().includes(q));
+  if (!semPr) lista.append(el("div", "vazio", "Não foi possível consultar as branches enviadas."));
+  else if (!itens.length) lista.append(el("div", "vazio", q ? "Nenhuma branch com essa busca." : "Nenhuma branch recente sem PR."));
+  for (const b of itens) {
+    const box = el("div", "pr"), [v, u] = idade(dias(b.pushedAt)), id = el("div", "idade");
+    id.append(el("b", null, v), el("small", null, u || "enviado"));
+    id.title = "Tempo desde o último push";
+    const corpo = el("div", "corpo"), t = el("div", "titulo-pr"), a = el("a", null, b.branch);
+    a.href = b.url; a.target = "_blank"; a.rel = "noopener";
+    t.append(el("span", "ponto rascunho"), a);
+    const meta = el("div", "meta");
+    meta.append(el("span", null, b.repo), el("span", null, `${b.ahead} ${b.ahead > 1 ? "commits" : "commit"} à frente de ${b.base}`));
+    corpo.append(t, meta);
+    const acoes = el("div", "acoes"), abrir = el("a"), btn = el("button", "ok", "Abrir PR");
+    abrir.href = b.url; abrir.target = "_blank"; abrir.rel = "noopener"; abrir.append(btn);
+    acoes.append(abrir);
+    box.append(id, corpo, acoes);
+    lista.append(box);
+  }
+  sec.append(h, lista);
+  return sec;
 }
 
 function linhaFechado(p) {
@@ -443,7 +476,11 @@ async function carregar() {
   $("resumo").textContent = "Atualizando…";
   try {
     if (aba === "fechados") fechados = (await api("/api/fechados")).fechados;
-    else dados = await api("/api/prs");
+    else {
+      // as branches sem PR consultam mais coisas; não seguram a lista principal
+      api("/api/sem-pr").then(d => semPr = d.branches, () => semPr = null).then(render);
+      dados = await api("/api/prs");
+    }
     render();
     $("resumo").textContent = `Atualizado às ${new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}. Recarrega sozinho.`;
   } catch (e) {
@@ -507,6 +544,48 @@ def estado_merge(pr):
     return estado_pr(pr["repository"]["nameWithOwner"], pr["number"])
 
 
+@lru_cache(maxsize=None)
+def branch_padrao(repo):
+    r = gh("api", f"repos/{repo}", "--jq", ".default_branch")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def checar_branch(item):
+    """Devolve a branch se ela está à frente da padrão e não tem nenhum PR; senão None."""
+    (repo, branch), quando = item
+    base = branch_padrao(repo)
+    if not base or branch == base:
+        return None
+    ref = quote(branch, safe="/")
+    r = gh("api", f"repos/{repo}/compare/{base}...{ref}", "--jq", ".ahead_by")  # falha se a branch foi apagada
+    if r.returncode or not r.stdout.strip().isdigit() or int(r.stdout) == 0:
+        return None
+    ahead = int(r.stdout)
+    r = gh("pr", "list", "--repo", repo, f"--head={branch}", "--state", "all", "--json", "number", "--jq", "length")
+    if r.returncode or r.stdout.strip() != "0":
+        return None
+    return {"repo": repo, "branch": branch, "base": base, "ahead": ahead,
+            "pushedAt": quando, "url": f"https://github.com/{repo}/compare/{ref}?expand=1"}
+
+
+def branches_sem_pr():
+    """Branches que você enviou recentemente (eventos de push) e que ainda não têm PR."""
+    login = gh("api", "user", "--jq", ".login")
+    r = gh("api", f"users/{login.stdout.strip()}/events?per_page=100") if login.returncode == 0 else login
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip() or "falha no gh")
+    corte = datetime.now(timezone.utc) - timedelta(days=JANELA_PUSH_DIAS)
+    pushes = {}
+    for e in json.loads(r.stdout):  # mais recentes primeiro
+        ref = e.get("payload", {}).get("ref", "")
+        if e["type"] == "PushEvent" and ref.startswith("refs/heads/") \
+                and datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")) >= corte:
+            pushes.setdefault((e["repo"]["name"], ref[len("refs/heads/"):]), e["created_at"])
+    with ThreadPoolExecutor(8) as ex:
+        achadas = [b for b in ex.map(checar_branch, pushes.items()) if b]
+    return sorted(achadas, key=lambda b: b["pushedAt"], reverse=True)
+
+
 def buscar_fechados():
     r = gh("search", "prs", "--author", "@me", "--state", "closed", "--sort", "updated",
            "--limit", "100", "--json", CAMPOS_FECHADOS)
@@ -550,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(dados)
             elif url.path == "/api/prs":
                 self._json(200, {"meus": buscar("--author"), "revisao": buscar("--review-requested")})
+            elif url.path == "/api/sem-pr":
+                self._json(200, {"branches": branches_sem_pr()})
             elif url.path == "/api/fechados":
                 self._json(200, {"fechados": buscar_fechados()})
             elif url.path == "/api/diff":
